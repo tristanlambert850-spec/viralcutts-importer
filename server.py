@@ -92,6 +92,11 @@ def execute(args, timeout, job_id=None):
                 continue
         if proc.returncode:
             reason = stderr.lower()
+            # Short diagnostic without signed URLs, source IDs, or job tokens.
+            diagnostic = next((line for line in reversed(stderr.splitlines()) if 'error' in line.lower()), 'Downloader failed')
+            diagnostic = re.sub(r'https?://\S+', '[URL]', diagnostic)
+            diagnostic = re.sub(r'\b[A-Za-z0-9_-]{11,}\b', '[redacted]', diagnostic)
+            print('Importer: ' + diagnostic[:400], flush=True)
             if 'confirm you' in reason or 'bot' in reason:
                 raise ValueError('YouTube blocked this hosting server with a sign-in check. Upload a video file instead; changing the link may not help.')
             if 'requested format is not available' in reason:
