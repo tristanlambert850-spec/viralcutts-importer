@@ -1,5 +1,4 @@
 """Small, bounded YouTube import service for a single-instance demo."""
-import hmac
 import json
 import os
 from pathlib import Path
@@ -19,7 +18,6 @@ ROOT = Path(tempfile.mkdtemp(prefix='viralcutts-'))
 JOBS = {}
 LOCK = threading.Lock()
 WORKER = threading.Semaphore(1)
-ACCESS_CODE = os.environ.get('DEMO_ACCESS_CODE', '')
 ORIGIN = os.environ.get('ALLOWED_ORIGIN', 'https://tax1234-viralcutts.static.hf.space').rstrip('/')
 
 
@@ -113,13 +111,6 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def authorized(self):
-        if not ACCESS_CODE:
-            self.reply(503, {'message': 'The owner must configure DEMO_ACCESS_CODE before importing.'})
-            return False
-        supplied = self.headers.get('Authorization', '').removeprefix('Bearer ')
-        if not hmac.compare_digest(supplied.encode(), ACCESS_CODE.encode()):
-            self.reply(401, {'message': 'Enter the demo access code provided by the owner.'})
-            return False
         origin = self.headers.get('Origin')
         if origin and origin != ORIGIN:
             self.reply(403, {'message': 'This origin is not allowed.'})
@@ -129,7 +120,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self.common(204)
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Authorization, Content-Type')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.end_headers()
 
     def do_POST(self):
@@ -158,7 +149,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/health':
-            return self.reply(200, {'status': 'ok', 'configured': bool(ACCESS_CODE)})
+            return self.reply(200, {'status': 'ok', 'access': 'public'})
         if not self.authorized():
             return
         cleanup()
