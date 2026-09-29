@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: viralcutts-importer
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DEMO_ACCESS_CODE
+        generateValue: true
+      - key: ALLOWED_ORIGIN
+        value: https://tax1234-viralcutts.static.hf.space
