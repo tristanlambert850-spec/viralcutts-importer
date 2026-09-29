@@ -1,6 +1,8 @@
 """Small, bounded YouTube import service for a single-instance demo."""
 import json
 import os
+import math
+import signal
 from pathlib import Path
 import re
 import secrets
@@ -33,7 +35,7 @@ def canonical_youtube_url(value):
     elif host in ('youtube.com', 'www.youtube.com', 'm.youtube.com'):
         if p.path == '/watch':
             video_id = parse_qs(p.query).get('v', [''])[0]
-        elif p.path.startswith(('/shorts/', '/embed/')):
+        elif p.path.startswith(('/shorts/', '/embed/', '/live/')):
             video_id = p.path.split('/')[2]
         else:
             video_id = ''
@@ -55,27 +57,92 @@ def cleanup():
                 shutil.rmtree(target)
 
 
-def execute(args, timeout):
-    result = subprocess.run([sys.executable, '-m', 'yt_dlp', '--ignore-config', '--no-playlist', '--js-runtimes', 'node', '--socket-timeout', '15', '--retries', '1', *args], capture_output=True, text=True, timeout=timeout)
-    if result.returncode:
-        raise ValueError('YouTube did not allow this import. The video may be restricted, or YouTube may be blocking this server. Try another public video or upload the file.')
-    return result.stdout
+def parse_options(data):
+    mode = data.get('mode', 'video')
+    start, seconds = data.get('start', 0), data.get('seconds', 30)
+    if mode not in ('video', 'live', 'replay'):
+        raise ValueError('Choose video, live capture, or replay section.')
+    if any(isinstance(n, bool) or not isinstance(n, (float, int)) or not math.isfinite(n) for n in (start, seconds)):
+        raise ValueError('Enter valid numeric times.')
+    if not 0 <= start <= 604800 or not 15 <= seconds <= 120:
+        raise ValueError('Choose a start within seven days and a clip length from 15 to 120 seconds.')
+    return mode, start, seconds
 
 
-def import_video(job_id, url):
+class Cancelled(Exception):
+    pass
+
+
+def execute(args, timeout, job_id=None):
+    command = [sys.executable, '-m', 'yt_dlp', '--ignore-config', '--no-playlist', '--js-runtimes', 'node', '--socket-timeout', '15', '--retries', '1', *args]
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=os.name != 'nt')
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            if job_id and JOBS[job_id].get('cancel'):
+                raise Cancelled()
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(command, timeout)
+            if job_id and sum(p.stat().st_size for p in (ROOT / job_id).glob('*') if p.is_file()) > MAX_BYTES * 2:
+                raise ValueError('Import exceeds the storage limit. Choose a shorter section.')
+            try:
+                stdout, stderr = proc.communicate(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if proc.returncode:
+            reason = stderr.lower()
+            if 'confirm you' in reason or 'bot' in reason:
+                raise ValueError('YouTube blocked this hosting server with a sign-in check. Upload a video file instead; changing the link may not help.')
+            if 'requested format is not available' in reason:
+                raise ValueError('This source has no compatible MP4 stream. Upload a video file instead.')
+            raise ValueError('YouTube could not provide this video. It may be unavailable or restricted. Try another public video or upload a file.')
+        return stdout
+    finally:
+        if proc.poll() is None:
+            if os.name != 'nt':
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            else:
+                proc.kill()
+            proc.communicate()
+
+
+def import_video(job_id, url, mode='video', start=0, seconds=30):
     folder = ROOT / job_id
     folder.mkdir()
     try:
-        metadata = json.loads(execute(['--skip-download', '--dump-single-json', url], 45))
+        metadata = json.loads(execute(['--skip-download', '--dump-single-json', url], 60, job_id))
         duration = metadata.get('duration')
-        if metadata.get('is_live') or not isinstance(duration, (int, float)) or not 0 < duration <= 900:
+        live = bool(metadata.get('is_live'))
+        if mode == 'live' and not live:
+            raise ValueError('This video is not live now. Choose Replay section or Full video.')
+        if mode != 'live' and live:
+            raise ValueError('This stream is live. Choose Live capture to record a short clip.')
+        if mode == 'video' and (not isinstance(duration, (int, float)) or not 0 < duration <= 900):
             raise ValueError('The free demo accepts recorded videos up to 15 minutes long.')
-        execute(['--no-progress', '--max-filesize', str(MAX_BYTES), '--format', 'best[ext=mp4][height<=480][vcodec^=avc1][acodec!=none]/bestvideo[ext=mp4][height<=480][vcodec^=avc1]+bestaudio[ext=m4a]', '--merge-output-format', 'mp4', '--output', str(folder / 'source.%(ext)s'), url], 240)
+        if mode == 'replay' and (not isinstance(duration, (int, float)) or start >= duration):
+            raise ValueError('The replay is not available yet, or the start is past its end.')
+        extra = []
+        if mode == 'live':
+            extra = ['--no-live-from-start', '--downloader', 'ffmpeg', '--downloader-args', f'ffmpeg_o:-t {seconds} -fs {MAX_BYTES}']
+        elif mode == 'replay':
+            extra = ['--download-sections', f'*{start}-{min(start + seconds, duration)}', '--downloader-args', f'ffmpeg_o:-fs {MAX_BYTES}']
+        with LOCK:
+            JOBS[job_id]['message'] = f'Capturing {seconds:g} seconds near the live edge…' if live else 'Downloading your selected video…'
+        execute(['--no-progress', '--max-filesize', str(MAX_BYTES), '--format', 'best[ext=mp4][height<=480][vcodec^=avc1][acodec!=none]/bestvideo[ext=mp4][height<=480][vcodec^=avc1]+bestaudio[ext=m4a]', '--merge-output-format', 'mp4', '--remux-video', 'mp4', '--output', str(folder / 'source.%(ext)s'), *extra, url], 240, job_id)
+        if JOBS[job_id].get('cancel'):
+            raise Cancelled()
         media = folder / 'source.mp4'
         if not media.is_file() or not 0 < media.stat().st_size <= MAX_BYTES:
             raise ValueError('This video exceeds the 150 MB demo limit or has no compatible MP4 format. Upload the file instead.')
         with LOCK:
             JOBS[job_id].update(state='ready', title=str(metadata.get('title') or 'YouTube video')[:160], size=media.stat().st_size)
+    except Cancelled:
+        with LOCK:
+            JOBS[job_id].update(state='cancelled', message='Import cancelled.')
     except subprocess.TimeoutExpired:
         with LOCK:
             JOBS[job_id].update(state='error', message='Import timed out. Try a shorter video or upload the file.')
@@ -86,7 +153,7 @@ def import_video(job_id, url):
     finally:
         with LOCK:
             JOBS[job_id]['expires'] = time.time() + 600
-        if JOBS[job_id]['state'] == 'error':
+        if JOBS[job_id]['state'] in ('error', 'cancelled'):
             shutil.rmtree(folder, ignore_errors=True)
         WORKER.release()
 
@@ -124,6 +191,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self):
+        cancel = re.fullmatch(r'/imports/([A-Za-z0-9_-]{32})/cancel', self.path)
+        if cancel:
+            if not self.authorized():
+                return
+            with LOCK:
+                job = JOBS.get(cancel[1])
+                if job and job['state'] == 'loading':
+                    job['cancel'] = True
+            return self.reply(202, {'message': 'Cancellation requested.'})
         if self.path != '/imports':
             return self.reply(404, {'message': 'Not found.'})
         if not self.authorized():
@@ -132,7 +208,9 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get('Content-Length', '0'))
             if not 0 < length < 4096:
                 return self.reply(413, {'message': 'Request is too large or empty.'})
-            url = canonical_youtube_url(json.loads(self.rfile.read(length)).get('url'))
+            data = json.loads(self.rfile.read(length))
+            url = canonical_youtube_url(data.get('url'))
+            mode, start, seconds = parse_options(data)
         except (ValueError, AttributeError, TypeError):
             return self.reply(400, {'message': 'Paste a valid HTTPS YouTube video link.'})
         cleanup()
@@ -143,8 +221,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(429, {'message': 'Another import is running. Try again shortly.'})
         job_id = secrets.token_urlsafe(24)
         with LOCK:
-            JOBS[job_id] = {'state': 'loading', 'expires': time.time() + 600}
-        threading.Thread(target=import_video, args=(job_id, url), daemon=True).start()
+            JOBS[job_id] = {'state': 'loading', 'message': 'Checking YouTube source…', 'expires': time.time() + 600}
+        threading.Thread(target=import_video, args=(job_id, url, mode, start, seconds), daemon=True).start()
         self.reply(202, {'id': job_id, 'state': 'loading'})
 
     def do_GET(self):
@@ -162,7 +240,7 @@ class Handler(BaseHTTPRequestHandler):
         if not job:
             return self.reply(404, {'message': 'Import expired or server restarted. Import the link again.'})
         if not file_request:
-            return self.reply(200, {key: value for key, value in job.items() if key != 'expires'})
+            return self.reply(200, {key: value for key, value in job.items() if key not in ('expires', 'cancel')})
         if job['state'] != 'ready':
             return self.reply(409, {'message': 'Video is not ready.'})
         try:
