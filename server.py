@@ -3,6 +3,7 @@ import json
 import os
 import math
 import signal
+import hashlib
 from pathlib import Path
 import re
 import secrets
@@ -21,6 +22,29 @@ JOBS = {}
 LOCK = threading.Lock()
 WORKER = threading.Semaphore(1)
 ORIGIN = os.environ.get('ALLOWED_ORIGIN', 'https://tax1234-viralcutts.static.hf.space').rstrip('/')
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '')
+TOKEN_CACHE = {}
+
+
+def verify_google_credential(token):
+    if not GOOGLE_CLIENT_ID or not token or len(token) > 8192:
+        raise ValueError('Sign in with Google to continue.')
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    with LOCK:
+        cached = TOKEN_CACHE.get(digest)
+    if cached and cached['until'] > time.time():
+        return cached['profile']
+    from google.oauth2 import id_token
+    from google.auth.transport.requests import Request
+    claims = id_token.verify_oauth2_token(token, Request(), GOOGLE_CLIENT_ID)
+    if not claims.get('sub') or not claims.get('email_verified'):
+        raise ValueError('Use a verified Google account.')
+    profile = {'sub': claims['sub'], 'name': str(claims.get('name') or 'Creator')[:120]}
+    with LOCK:
+        if len(TOKEN_CACHE) >= 256:
+            TOKEN_CACHE.clear()
+        TOKEN_CACHE[digest] = {'profile': profile, 'until': min(time.time()+60, float(claims['exp']))}
+    return profile
 
 
 def canonical_youtube_url(value):
@@ -193,12 +217,21 @@ class Handler(BaseHTTPRequestHandler):
         if origin and origin != ORIGIN:
             self.reply(403, {'message': 'This origin is not allowed.'})
             return False
+        if not GOOGLE_CLIENT_ID:
+            self.reply(503, {'message': 'Google sign-in is awaiting owner configuration.'})
+            return False
+        try:
+            header = self.headers.get('Authorization', '')
+            self.user = verify_google_credential(header[7:] if header.startswith('Bearer ') else '')
+        except Exception:
+            self.reply(401, {'message': 'Your sign-in expired or could not be verified. Sign in with Google again.'})
+            return False
         return True
 
     def do_OPTIONS(self):
         self.common(204)
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Allow-Headers', 'Authorization, Content-Type')
         self.end_headers()
 
     def do_POST(self):
@@ -208,7 +241,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             with LOCK:
                 job = JOBS.get(cancel[1])
-                if job and job['state'] == 'loading':
+                if job and job.get('owner') == self.user['sub'] and job['state'] == 'loading':
                     job['cancel'] = True
             return self.reply(202, {'message': 'Cancellation requested.'})
         if self.path != '/imports':
@@ -237,15 +270,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(429, {'message': 'Video transfers are still running. Retry when they finish.'})
         job_id = secrets.token_urlsafe(24)
         with LOCK:
-            JOBS[job_id] = {'state': 'loading', 'message': 'Checking YouTube source…', 'expires': time.time() + 600}
+            JOBS[job_id] = {'state': 'loading', 'owner': self.user['sub'], 'message': 'Checking YouTube source…', 'expires': time.time() + 600}
         threading.Thread(target=import_video, args=(job_id, url, mode, start, seconds), daemon=True).start()
         self.reply(202, {'id': job_id, 'state': 'loading'})
 
     def do_GET(self):
         if self.path == '/health':
-            return self.reply(200, {'status': 'ok', 'access': 'public'})
+            return self.reply(200, {'status': 'ok', 'access': 'google', 'configured': bool(GOOGLE_CLIENT_ID)})
+        if self.path == '/auth/config':
+            return self.reply(200, {'client_id': GOOGLE_CLIENT_ID})
         if not self.authorized():
             return
+        if self.path == '/auth/me':
+            return self.reply(200, {'name': self.user['name']})
         cleanup()
         match = re.fullmatch(r'/imports/([A-Za-z0-9_-]{32})(/file)?', self.path)
         if not match:
@@ -253,10 +290,10 @@ class Handler(BaseHTTPRequestHandler):
         job_id, file_request = match.groups()
         with LOCK:
             job = dict(JOBS.get(job_id, {}))
-        if not job:
+        if not job or job.get('owner') != self.user['sub']:
             return self.reply(404, {'message': 'Import expired or server restarted. Import the link again.'})
         if not file_request:
-            return self.reply(200, {key: value for key, value in job.items() if key not in ('expires', 'cancel')})
+            return self.reply(200, {key: value for key, value in job.items() if key not in ('expires', 'cancel', 'owner')})
         if job['state'] != 'ready':
             return self.reply(409, {'message': 'Video is not ready.'})
         with LOCK:

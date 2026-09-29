@@ -1,1 +1,2 @@
 yt-dlp[default]
+google-auth[requests]>=2.38,<3
