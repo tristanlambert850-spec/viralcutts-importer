@@ -47,14 +47,20 @@ def canonical_youtube_url(value):
     return 'https://www.youtube.com/watch?v=' + video_id
 
 
-def cleanup():
+def cleanup(make_room=False):
+    """Bound disk usage without making completed attempts block new imports."""
     with LOCK:
-        expired = [key for key, job in JOBS.items() if job['expires'] < time.time() and job['state'] != 'loading']
-        for key in expired:
-            JOBS.pop(key, None)
-            target = ROOT / key
-            if target.parent == ROOT and target.is_dir():
-                shutil.rmtree(target)
+        removable = sorted(
+            ((key, job) for key, job in JOBS.items()
+             if job['state'] != 'loading' and not job.get('readers')),
+            key=lambda item: item[1]['expires'])
+        for key, job in removable:
+            if job['expires'] < time.time() or (make_room and len(JOBS) >= 3):
+                target = ROOT / key
+                if target.parent == ROOT and target.is_dir():
+                    shutil.rmtree(target)
+                JOBS.pop(key, None)
+
 
 
 def parse_options(data):
@@ -218,12 +224,17 @@ class Handler(BaseHTTPRequestHandler):
             mode, start, seconds = parse_options(data)
         except (ValueError, AttributeError, TypeError):
             return self.reply(400, {'message': 'Paste a valid HTTPS YouTube video link.'})
-        cleanup()
-        with LOCK:
-            if len(JOBS) >= 3:
-                return self.reply(429, {'message': 'Demo storage is full. Wait 10 minutes before another import.'})
         if not WORKER.acquire(blocking=False):
             return self.reply(429, {'message': 'Another import is running. Try again shortly.'})
+        try:
+            cleanup(make_room=True)
+        except OSError:
+            WORKER.release()
+            return self.reply(503, {'message': 'Temporary storage is unavailable. Please retry.'})
+        with LOCK:
+            if len(JOBS) >= 3:
+                WORKER.release()
+                return self.reply(429, {'message': 'Video transfers are still running. Retry when they finish.'})
         job_id = secrets.token_urlsafe(24)
         with LOCK:
             JOBS[job_id] = {'state': 'loading', 'message': 'Checking YouTube source…', 'expires': time.time() + 600}
@@ -248,6 +259,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(200, {key: value for key, value in job.items() if key not in ('expires', 'cancel')})
         if job['state'] != 'ready':
             return self.reply(409, {'message': 'Video is not ready.'})
+        with LOCK:
+            if job_id not in JOBS:
+                return self.reply(404, {'message': 'Import expired. Import the link again.'})
+            JOBS[job_id]['readers'] = JOBS[job_id].get('readers', 0) + 1
         try:
             with (ROOT / job_id / 'source.mp4').open('rb') as media:
                 self.common(200, 'video/mp4')
@@ -256,6 +271,10 @@ class Handler(BaseHTTPRequestHandler):
                 shutil.copyfileobj(media, self.wfile, 64 * 1024)
         except (FileNotFoundError, BrokenPipeError, ConnectionResetError):
             return
+        finally:
+            with LOCK:
+                if job_id in JOBS:
+                    JOBS[job_id]['readers'] -= 1
 
 
 if __name__ == '__main__':
